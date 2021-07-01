@@ -1,0 +1,346 @@
+---
+title: "Tree Classification"
+author: ""
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo=FALSE, include=FALSE}
+#Upload libraries
+library(dplyr)
+library(ggplot2)
+library(tree)
+library(randomForest)
+
+#Upload and clean the data
+data <- read.csv("C:/Users/Marco Cazzola/Downloads/churn_clean.csv") %>%
+  select(-c(1,7)) %>%
+  na.omit(data) 
+
+categorical <- c("Geography","Gender","HasCrCard",
+                 "IsActiveMember","Exited", "balance_category")
+data[categorical] <- lapply(data[categorical], as.factor)
+data$Tenure <- factor(data$Tenure, ordered =TRUE)
+data$NumOfProducts <- factor(data$NumOfProducts, ordered=TRUE)
+data$balance_category <- factor(data$balance_category,
+                                levels=c("<50K", "50K-100K", "100K-150K", "150K-200K", ">200K"),
+                                ordered=TRUE)
+
+#Splitting training and test
+set.seed(123)
+train <- sample(1:nrow(data), round(nrow(data)*0.7))
+train_set <- data[train,]
+test_set <- data[-train,]
+```
+## Single classification tree
+
+Differently from logistic regression, trees are non-parametric methods which can be used both for classification and regression purposes. From a geometrical point of view, a tree is a predictor that *stratifies* the predictors space into hyperboxes. In case of classification, all the points falling in a certain box are assigned the same label, which is the one occurring most frequently in the training set in that box (or *region*). 
+
+Especially in the regression case, trees are not competitive in terms of accuracy with respect to other methods, like linear regression. Trees work better in the classification case, and they have the big advantage of being interpretable, differently from the logistic regression setting, where meaning of the coefficients is not very intuitive.  
+
+After splitting the dataset into a training (70%) and validation (30%) set with the same procedure as in the logistic regression, we build the tree using observations from the training set. A summary of the performance of the tree over the training set is shown below.
+
+```{r, echo=F}
+tree.churn <- tree(Exited ~ ., train_set)
+summary(tree.churn)
+```
+
+First of all, we can notice that only three out of ten variables were used by the tree. Moreover, the resulting tree is quite small: it presents just eight terminal nodes, or *leaves*. Despite the small structure, the tree was able to correctly classify about 85% of the examples in the training set, resulting in a misclassification rate of 15%. We now take a closer look at the tree, and more precisely we consider the distribution of the response in the terminal nodes, indicated by the symbol * at the end of the row. 
+
+```{r, echo=F}
+tree.churn
+```
+
+We notice that some leaves are very close to be pure:
+
+* The purest leaf is number 7, with 133 training examples attached, 96,24% of which are labeled 1. This leaf collects people who hold more than two products of the bank and whose age is above 41.5. 
+* The less pure leaf is number 48, with 402 training examples attached, 55% of which are labeled 1. This leaf collects not active members holding just one product and whose age is between 41.5 and 49.5.
+
+Interestingly, there are two splits which appear to be completely useless, as they assign the same label independently from the result of the associated node test, as in the case of node 24 split. However, this split is not useless as it may appear at first sight. In fact, before the splitting the distribution inside the leaf was only 67-33, which is not so pure. However, node 49 presents a high degree of purity. In other words, even though the split does not reduce the training error, it definitely helps in reducing measures of impurity like the Gini Index or cross-entropy, and that is the reason why the split is performed anyway. 
+
+As anticipated in the introduction, the main advantage of trees is their interpretability. This is particularly true in our case, where the tree is very simple and short. 
+
+```{r, echo=F}
+plot(tree.churn)
+text(tree.churn,pretty=0)
+```
+
+Given any example, one can easily classify it following the corresponding branches on the tree. 
+
+We can now give an intuitive representation of the tree classifier in the feature space, considering the pruned version of the tree shown above. More precisely, if we cut the tree at the second level of depth, we are dealing with just two variables (`Age` and `NumOfProd`), and therefore we can obtain a graphical representation of the partition in the bi-dimensional space created by these two variables.
+
+```{r, echo=F}
+tree.part <- ggplot(data, aes(x=Age, y=NumOfProducts)) + 
+  geom_jitter(aes(color=Exited), position=position_jitter(0.2)) +
+  theme_minimal() +
+  geom_vline(xintercept = 41.5, linetype = "dashed") +
+  geom_hline(yintercept = 2.5, linetype = "dashed") +
+  #Bottom rect
+  annotate("rect",xmin=0, xmax=95,
+           ymin=0, ymax=2.5, alpha=0.2, fill="#F8766D") +
+  #Top rect
+  annotate("rect",xmin=0, xmax=95,
+           ymin=2.5, ymax=4.2, alpha=0.2, fill="#619CFF") 
+tree.part
+```
+
+As we can see in this simplified representation, the two cutoffs divide the predictors space into four regions. We immediately notice that in each region one of the labels is always occurring more than the other: in the top-right quadrant almost all examples are churns, while in the bottom-left region almost all examples are non-churns.  
+
+In order to properly evaluate the predictor, we compute the misclassification rate over the test set. 
+
+```{r, echo=F}
+tree.pred <- predict(tree.churn,test_set,type="class")
+mean(tree.pred != test_set$Exited)
+```
+
+The test error is a little bit smaller than the training error, resulting in an apparently very good performance for this simple classifier also in the test set. However, it turns out that the tree is not so good in predicting actual churns, i.e. the classifier presents a very low sensitivity. 
+
+```{r, echo=F}
+table(tree.pred, test_set$Exited)
+list("Specificity" = 2292/(2292+98), "Sensitivity" = 268/(268+342))
+```
+
+The model is very good at predicting non-churns, while the number of misclassified churns are more than the ones correctly classified. In other words, the model presents a high level of specificity, but a low degree of sensitivity. This may be related to the unbalance in the dataset, where 80% of the observations are non-churns; nonetheless, we would like to boost the goodness of our classifier in terms of sensitivity. Instead of predicting the actual label of the test example, we now predict the probability distribution associated to it, so that we can set different threshold and understand how sensitivity and specificity evolves as we change the assignment threshold. 
+
+```{r, echo=F}
+pred <- predict(tree.churn,test_set,type="vector")
+sens.tree <- NULL
+spec.tree <- NULL
+err.tree <- NULL
+j <- 1
+
+for (i in seq(from=0.1, to=0.9, by=0.1)) {
+  tree.pred <- ifelse(pred[,2] > i, 1, 0)
+  tree.pred <- as.factor(tree.pred)
+  t <- table(tree.pred, test_set$Exited)
+  sens.tree[j] <- t[4]/(t[3]+t[4]) 
+  spec.tree[j] <- t[1]/(t[1]+t[2])
+  err.tree[j] <- (t[2]+t[3])/(t[1]+t[2]+t[3]+t[4])
+  j <- j+1
+}
+matplot(seq(from=0.1, to=0.9, by=0.1),cbind(sens.tree, spec.tree, err.tree), 
+        type="b", pch = c(18,19,20), col=c("blue","red","black"),
+        ylab="", xlab="Probability threshold")
+legend("right", legend=c("Sensitivity","Specificity", "Test error"),
+       pch=c(18,19,20),col=c("blue","red","black"),cex=0.7)
+```
+
+The probability threshold of 0.2 seem to yield the optimal performance for our tree according to all of the three analysed aspects. More precisely, we obtain a tree with the following characteristics: 
+
+```{r, echo=FALSE}
+list("Sensitivity" = sens.tree[2],
+     "Specificity" = spec.tree[2],
+     "Test misclassification rate" = err.tree[2])
+```
+
+In other words, the gains in terms of sensitivity definitely outclass the losses in terms of test error and specificity.  
+
+## Pruned Trees
+
+Even though our tree is already short and performs pretty well, we can try to prune it, i.e. reduce its complexity and consequently the variance of the prediction, at the price of a higher bias. Pruned trees involve the selection of a tuning parameter that penalizes the total number of leaves T. We use cross validation to choose the optimal value for that parameter, and then we plot the misclassification rate of the output classifier as the value of the parameter changes. 
+
+```{r, echo=FALSE}
+cv.prun <- cv.tree(tree.churn, FUN = prune.misclass)
+plot(cv.prun)
+```
+
+As one could expect, pruning a short tree doesn't improve the predictive performance; indeed, we observe the opposite. The graph in fact shows that the lower misclassification rate is the one reached by the largest tree, which is our starting one. 
+
+## Bagging
+
+
+As already stated in the introduction, trees are usually not so powerful predictors in terms of accuracy. One of the main techniques to improve their performance is bagging, which is based on bootstrap. Basically, we perform bootstrapping to create several different training sets from our original one; then a tree is grown on each of this training set and the final prediction for any given example is the majority of the label predicted by the whole set of trees. By averaging the predictions, we successfully reduce the variance of the prediction, just like the variance of the sample mean of a random variable is lower than the variance of the random variable itself. We therefore analyse how the training error changes as the number of bootstrapped sample increases. 
+
+```{r, echo=FALSE}
+test_bag <- NULL
+seq <- seq(from=0, to=500, by=50)
+seq[1] <- 1
+j <- 1
+for (i in seq) {
+  set.seed(123)
+  bag.var <- randomForest(Exited ~ ., train_set, 
+                            mtry=10, ntree=i)
+  pred <- predict(bag.var,test_set)
+  test_bag[j] <- mean(pred != test_set$Exited)
+  j <- j+1
+}
+
+plot(x=seq,y=test_bag,type="b",
+     xlab= "Nr of trees", ylab= "Test MisClass Rate")
+abline(h=0.1466667, col="red")
+```
+
+As we can see, the misclassification rate dramatically decrease initially, but then there is not much difference between performing bagging with 100 trees or with 400 trees, i.e. bootstrapped training sample. More precisely, the minimum value for the test error is 
+
+```{r, echo=FALSE}
+min(test_bag)
+```
+
+Reached by the forest of 500 trees. However, notice that all the values of the training error between 50 and 500 trees are within the interval of 5 thousandth, so there is not really much difference between those classifiers. With respect to the single tree (whose test error is the red line in the graph), we managed to improve the misclassification rate by just 0,4%. 
+
+We now plot the confusion matrix associated to the bagged predictor with 500 trees. 
+
+```{r, echo=FALSE}
+set.seed(123)
+bag.churn <- randomForest(Exited~.,train_set,mtry=10,ntree=500,importance=TRUE)
+
+bag.pred <- predict(bag.churn,test_set)
+table(bag.pred, test_set$Exited)
+
+list("Specificity"=2264/(123+2264), "Sensitivity" = 307/(307+303))
+```
+
+Once again, the results are not really comforting in terms of sensitivity, which for our "optimized" tree was 58%, and so higher than the one shown above. We therefore change our approach, and again predict the probability distribution of the label rather than the label itself. The sensitivity-specificity trade-off graph is shown below. 
+
+```{r, echo=FALSE}
+sens.bag <- NULL
+spec.bag <- NULL
+err.bag <- NULL
+j <- 1
+pred <- predict(bag.churn,test_set, type="prob")
+for (i in seq(from=0.1, to=0.9, by=0.1)) {
+  bag.pred <- ifelse(pred[,2] > i, 1, 0)
+  bag.pred <- as.factor(bag.pred)
+  t <- table(bag.pred, test_set$Exited)
+  sens.bag[j] <- t[4]/(t[3]+t[4]) 
+  spec.bag[j] <- t[1]/(t[1]+t[2])
+  err.bag[j] <- (t[2]+t[3])/(t[1]+t[2]+t[3]+t[4])
+  j <- j+1
+}
+matplot(seq(from=0.1, to=0.9, by=0.1),cbind(sens.bag, spec.bag, err.bag), 
+        type="b", pch = c(18,19,20), col=c("blue","red","black"),
+        ylab="", xlab="Probability threshold")
+legend("right", legend=c("Sensitivity","Specificity", "Test error"),
+       pch=c(18,19,20),col=c("blue","red","black"),cex=0.7)
+```
+
+Again, 0.2 seems to be the optimal value, according to which we obtain a classifier with the following characteristics: 
+
+```{r, echo=FALSE}
+list("Sensitivity" = sens.bag[2],
+     "Specificity" = spec.bag[2],
+     "Test misclassification rate" = err.bag[2])
+```
+
+We now investigate which were the variables that were more often considered in the forest we have just grown. 
+
+```{r, echo=FALSE}
+bag.importance <- as.data.frame(importance(bag.churn))
+bag.graph <- ggplot(bag.importance,aes(x=reorder(rownames(bag.importance),MeanDecreaseGini),y=MeanDecreaseGini)) + 
+  geom_bar(stat="identity", fill="red",color="black") +
+  geom_text(aes(label=round(MeanDecreaseGini,digits=2)), 
+            hjust=1, color="white", size=3) +
+  theme_minimal() + xlab("Variables") + coord_flip()
+
+bag.graph
+```
+
+`Age` still plays the most relevant role in obtaining pure leaves, and in fact was placed at the root of the tree we estimated at the beginning. `NumOfProducts` is now in the middle of the ranking, while `IsActiveMember` plays a totally secondary role. `Gender` and `HasCrCard` are the less important variables. 
+
+## Random Forests
+
+We now consider random forests for our classification problem. This approach is expected to improve the performance of bagging, especially in those settings where some of the available predictors are more correlated than others. In fact, what would happen in this case is that most of the trees built on different training sets will use the same (most correlated) set of variables, resulting in a forest of very similar (and therefore correlated) trees. Unfortunately, averaging correlated predictions does not reduce the variance of the classifier, rather the opposite. Random forests therefore provide a way of *decorrelating* the grown trees. They do so by considering only a random sample of the available predictors for each split. In other words, at each split the algorithm will consider different predictors, so that the final set of trees will not be similar as in the case of bagging. The typical choice for the number of predictors to be considered at each split is the square root of the number of available predictors, so in our case we will select m = 3. As done for bagging, we now investigate how the test error changes with different number of trees in the forest. 
+
+```{r, echo=FALSE}
+test_rf <- NULL
+j <- 1
+for (i in seq) {
+  set.seed(123)
+  rf.var <- randomForest(Exited ~ ., train_set, 
+                          mtry=3, ntree=i)
+  pred <- predict(rf.var,test_set)
+  test_rf[j] <- mean(pred != test_set$Exited)
+  j <- j+1
+}
+plot(x=seq,y=test_rf,type="b",
+     xlab= "Nr of trees", ylab= "MisClass Rate")
+abline(h=0.1466667, col="red")
+```
+
+As for bagging, also the random forest show a strong decrease initially which is immediately stabilized after 100 trees. However, differently from bagging, the performances of random forest are significantly better than the single tree, whose test error is represented by the red line. 
+
+The minimum test error with random forest is 
+
+```{r, echo=FALSE}
+min(test_rf)
+```
+
+Reached for 400. We therefore consider this particular random forest and plot the associated confusion matrix.
+
+```{r, echo=FALSE}
+set.seed(123)
+rf.churn <- randomForest(Exited ~ ., train_set, 
+                         mtry=3, ntree=400,importance=TRUE)
+
+rf.pred <- predict(rf.churn,test_set)
+table(rf.pred, test_set$Exited)
+```
+
+As for bagging, also the random forest shows a low degree of sensitivity, even lower than bagging, which correctly classified half of the churns even before the sensitivity optimization. 
+
+```{r, echo=FALSE}
+list("Specificity"=2299/(91+2299), "Sensitivity" = 280/(330+280))
+```
+
+Since random forest is basically bagging with random predictors considered at each split, we apply once again the 0.2 threshold and see if there are improvements in terms of sensitivity. The results are shown below. 
+
+```{r, echo=FALSE}
+pred <- predict(rf.churn,test_set, type="prob")
+rf.pred <- ifelse(pred[,2] > 0.2, 1, 0)
+rf.pred <- as.factor(rf.pred)
+table(rf.pred, test_set$Exited)
+list("Sensitivity" = 463/(463+147),
+     "Specificity" = 1859/(1859+531),
+     "Test misclassification rate" = (147+531)/3000)
+```
+
+With respect to bagging, the random forest yields a higher value of specificity and a lower test error, while the sensitivity is more or less the same. 
+
+We know investigate which were the variables more relevant in the decrease of the Gini Index for the random forest we have just grown. 
+
+```{r, echo=FALSE}
+rf.importance <- as.data.frame(importance(rf.churn))
+rf.graph <- ggplot(rf.importance,aes(x=reorder(rownames(rf.importance),MeanDecreaseGini),y=MeanDecreaseGini)) + 
+  geom_bar(stat="identity", fill="red",color="black") +
+  geom_text(aes(label=round(MeanDecreaseGini,digits=2)), 
+            hjust=1, color="white", size=3) +
+  theme_minimal() + xlab("Variables") + coord_flip()
+rf.graph
+```
+
+The plot is not very different from the one shown for bagging, with `Age` still playing the leading role. 
+
+## Overall comparison
+
+We now compare random forest and bagging as the number of trees enlarges. 
+
+```{r, echo=FALSE}
+seq <- seq[-1]
+test_bag <- test_bag[-1]
+test_rf <- test_rf[-1]
+matplot(seq, cbind(test_bag,test_rf), type="b", pch=c(19,18), col=c("red","blue"), xlab="Nr of trees", ylab="MisClass Rate", ylim=c(0.135,0.148))
+abline(h=0.1466667, col="green", lwd=2)
+legend("right",inset=c(0, -1), legend=c("Single Tree","Bagging","Random Forest"),pch=c(19,18), col=c("green","red","blue"))
+```
+
+As shown by the graph, the performance of bagging and single tree do not differ much; only for a large number of trees we can observe some relevant difference. The real improvement is with the random forest, whose curve is always below the other two: the minimum test error of random forest is in fact 1% lower than the test error of the single tree. Overall, random forest performs significantly better than bagging irrespective of the number of trees grown.
+
+The graph below instead summarizes the performances of the three algorithms in their "sensitivity-optimized" version. 
+
+```{r, echo=FALSE}
+comparison <- data.frame("Pred" = rep(c("Single Tree","Bagging","Random Forest"),each=3),
+                         "Measure" = rep(c("Sensitivity","Specificity","Test error rate"),3),
+                         "Value" =  c(0.580,0.889,0.174,0.757,0.749,0.249,0.759,0.778,0.226))
+comp.graph <- ggplot(data=comparison, aes(x=Pred, y=Value, fill=Measure)) +
+  geom_bar(stat="identity", color="black",position=position_dodge())+
+  geom_text(aes(label=Value), vjust=1.6,
+            position = position_dodge(0.9), size=3.5)+
+  scale_fill_brewer(palette="Set3")+ theme_minimal()
+comp.graph
+```
+
+With respect to the other two methods, the single tree presents a very high imbalance between sensitivity and specificity, so we would discard this classifier. Bagging and random forest have a similar degree of sensitivity, but random forest performs better than bagging both for what concerns the test misclassification rate and the specificity. That is why we consider random forest to be the optimal choice among the three. 
