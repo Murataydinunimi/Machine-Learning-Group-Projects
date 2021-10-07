@@ -1,5 +1,4 @@
 # Machine-Learning-Group-Projects
 
-Here, we did a churn anaylsis that is a binary classfication through  Tree-Based models.
 
-We also applied unsupervised clustering methods on economic freedom index.
+We also applied unsupervised clustering methods on economic freedom index to understand how/why countries clustering based on their economic policy.
